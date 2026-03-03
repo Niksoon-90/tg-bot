@@ -9,8 +9,8 @@ import logging
 import os
 from datetime import datetime, timedelta, date
 
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import Conflict
 
 import sheet_diff
@@ -26,17 +26,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _last_data_keyboard():
+    """Клавиатура с кнопкой «Посмотреть последние данные»."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Посмотреть последние данные", callback_data="last_data")],
+    ])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Привет! Я бот отчётов по таблице Google Sheets.\n\n"
-        "Доступные команды:\n"
-        "/update – обновить данные"
-        "/history_today – история за сегодня.\n"
-        "/history_yesterday – история за вчера.\n"
-        "/last_update – когда последний раз были получены данные из Google Sheets.\n"
-        "/help – подсказка по командам."
+        "Доступные команды:\n\n"
+        "/update – обновить данные\n\n"
+        "/history_today – история за сегодня\n\n"
+        "/history_yesterday – история за вчера\n\n"
+        "/last_update – когда последний раз загружались данные\n\n"
+        "/help – подсказка по командам"
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=_last_data_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -259,10 +266,17 @@ async def _send_history_for_range(
     """Общий помощник: отправляет историю за указанный период."""
     changes = sheet_diff.list_resource_changes_in_range(start_date, end_date)
     if not changes:
-        await context.bot.send_message(
-            chat_id,
-            f"Отчётов за период {start_date} — {end_date} не найдено.",
-        )
+        if sheet_diff.has_reports_in_range(start_date, end_date):
+            await context.bot.send_message(
+                chat_id,
+                f"За период {start_date} — {end_date} изменений в количестве ресурсов не было.",
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"Отчётов за период {start_date} — {end_date} не найдено. "
+                "Сделайте /update или подождите автообновления.",
+            )
         return
 
     header = f"Период: {start_date} — {end_date}"
@@ -297,21 +311,27 @@ async def history_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _send_history_for_range(chat_id, d, d, context)
 
 
+def _format_last_update_message():
+    """Формирует текст о последнем обновлении данных (для команды и для кнопки)."""
+    dt = sheet_diff.get_last_update_time()
+    if dt is None:
+        return "Данные из Google Sheets ещё ни разу не загружались (нет сохранённых отчётов)."
+    return f"Последнее обновление данных из Google Sheets: {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+
+
 async def last_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает, когда в последний раз были получены данные из Google Sheets."""
     chat_id = update.effective_chat.id
-    dt = sheet_diff.get_last_update_time()
-    if dt is None:
-        await context.bot.send_message(
-            chat_id,
-            "Данные из Google Sheets ещё ни разу не загружались (нет history JSON).",
-        )
-        return
+    text = _format_last_update_message()
+    await context.bot.send_message(chat_id, text)
 
-    await context.bot.send_message(
-        chat_id,
-        f"Последнее обновление данных из Google Sheets: {dt.strftime('%Y-%m-%d %H:%M:%S')}",
-    )
+
+async def button_last_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопки «Посмотреть последние данные»."""
+    query = update.callback_query
+    await query.answer()
+    text = _format_last_update_message()
+    await query.edit_message_text(text=text, reply_markup=_last_data_keyboard())
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -394,6 +414,7 @@ def main() -> None:
     application.add_handler(CommandHandler("history_today", history_today))
     application.add_handler(CommandHandler("history_yesterday", history_yesterday))
     application.add_handler(CommandHandler("last_update", last_update))
+    application.add_handler(CallbackQueryHandler(button_last_data, pattern="^last_data$"))
     application.add_error_handler(error_handler)
 
     logger.info("Бот запущен. Нажми Ctrl+C для остановки.")

@@ -37,6 +37,11 @@ GID = "1963801173"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "sheet_versions"
 REPORTS_DIR = BASE_DIR / "reports"
+# Только два CSV: текущая и предыдущая версия (без плодения файлов)
+CURRENT_SHEET_PATH = DATA_DIR / "sheet_current.csv"
+PREVIOUS_SHEET_PATH = DATA_DIR / "sheet_previous.csv"
+# Время последней загрузки таблицы (обновляется при каждой успешной выгрузке)
+LAST_FETCH_TIME_FILE = REPORTS_DIR / "last_fetch_time.txt"
 COLUMN_RESOURCES = "Количество ресурсов, необходимое к подбору"
 RETENTION_DAYS = 183  # храним данные примерно за полгода
 
@@ -50,10 +55,9 @@ def ensure_dirs():
 
 
 def cleanup_old_data():
-    """Удаляет старые версии и отчёты старше RETENTION_DAYS (примерно полгода)."""
+    """Удаляет старые отчёты (report_*.txt, changes_*.json) старше RETENTION_DAYS. CSV не трогаем — храним только 2 файла."""
     cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
     for directory, pattern in (
-        (DATA_DIR, "sheet_*.csv"),
         (REPORTS_DIR, "report_*.txt"),
         (REPORTS_DIR, "changes_*.json"),
     ):
@@ -65,7 +69,6 @@ def cleanup_old_data():
                 if mtime < cutoff:
                     path.unlink()
             except OSError:
-                # Не удалось удалить — просто пропускаем
                 continue
 
 
@@ -112,28 +115,29 @@ def row_key(row, headers):
 
 
 def load_previous():
-    """Загружает предыдущую версию (последний сохранённый файл до текущего запуска)."""
-    # Текущий файл мы ещё не сохранили — значит "предыдущий" это самый новый по времени
-    if not DATA_DIR.exists():
+    """Загружает предыдущую версию из sheet_previous.csv (если есть)."""
+    ensure_dirs()
+    if not PREVIOUS_SHEET_PATH.exists():
         return None
-    files = sorted(DATA_DIR.glob("sheet_*.csv"), key=os.path.getmtime, reverse=True)
-    if len(files) < 2:
+    try:
+        with open(PREVIOUS_SHEET_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            return parse_csv(f.read())
+    except OSError:
         return None
-    # Предыдущая версия — вторая по времени
-    prev_path = files[1]
-    with open(prev_path, "r", encoding="utf-8-sig", newline="") as f:
-        return parse_csv(f.read())
 
 
 def save_current(rows):
-    """Сохраняет текущую версию с меткой времени."""
+    """Сохраняет текущую версию: бывший current → previous, новые данные → current. Всегда только 2 CSV."""
     ensure_dirs()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = DATA_DIR / f"sheet_{ts}.csv"
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+    if CURRENT_SHEET_PATH.exists():
+        try:
+            CURRENT_SHEET_PATH.replace(PREVIOUS_SHEET_PATH)
+        except OSError:
+            pass
+    with open(CURRENT_SHEET_PATH, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
         writer.writerows(rows)
-    return path
+    return CURRENT_SHEET_PATH
 
 
 def _report_date_from_filename(path: Path):
@@ -251,12 +255,41 @@ def list_resource_changes_in_range(start_date, end_date):
     return changes
 
 
-def get_last_update_time():
+def has_reports_in_range(start_date, end_date):
     """
-    Возвращает datetime последнего обновления (по самым новым changes_*.json)
-    или None, если обновлений ещё не было.
+    Проверяет, есть ли хотя бы один сохранённый отчёт (changes_*.json)
+    за указанный период. Нужно для понятного сообщения:
+    «изменений не было» vs «отчётов за период ещё не собиралось».
     """
     ensure_dirs()
+    for path in REPORTS_DIR.glob("changes_*.json"):
+        name = path.name
+        ts_part = name[len("changes_") : -len(".json")]
+        try:
+            dt = datetime.strptime(ts_part, "%Y%m%d_%H%M%S")
+        except ValueError:
+            continue
+        d = dt.date()
+        if start_date <= d <= end_date:
+            return True
+    return False
+
+
+def get_last_update_time():
+    """
+    Возвращает datetime последней загрузки данных из Google Sheets.
+    Берётся из файла last_fetch_time.txt (обновляется при каждой выгрузке),
+    иначе — по самому новому changes_*.json.
+    """
+    ensure_dirs()
+    if LAST_FETCH_TIME_FILE.exists():
+        try:
+            with open(LAST_FETCH_TIME_FILE, "r", encoding="utf-8") as f:
+                line = f.read().strip()
+            if line:
+                return datetime.strptime(line, "%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError):
+            pass
     latest_dt = None
     for path in REPORTS_DIR.glob("changes_*.json"):
         name = path.name
@@ -410,6 +443,21 @@ def write_report(diff_result, report_path):
     return text
 
 
+def _write_changes_json(ts: str, resources_changes: list) -> None:
+    """Пишет changes_<ts>.json; при ошибке логирует в stderr."""
+    path = REPORTS_DIR / f"changes_{ts}.json"
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"timestamp": ts, "resources_changes": resources_changes},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except OSError as e:
+        print(f"Ошибка записи {path}: {e}", file=sys.stderr)
+
+
 def run_diff_and_get_report_path():
     """
     Выполняет полный цикл:
@@ -433,8 +481,19 @@ def run_diff_and_get_report_path():
     current_path = save_current(rows)
     print(f"Текущая версия сохранена: {current_path}")
 
+    # Время последней загрузки — обновляем при каждой успешной выгрузке (для /last_update)
+    try:
+        with open(LAST_FETCH_TIME_FILE, "w", encoding="utf-8") as f:
+            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    except OSError:
+        pass
+
     previous_rows = load_previous()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     if previous_rows is None:
+        # Всё равно пишем пустой отчёт за этот запуск — чтобы /history_today показывал «изменений не было», а не «отчётов не найдено»
+        _write_changes_json(ts, [])
         print("Предыдущей версии нет — это первый запуск. Отчёт по изменениям будет после следующего запуска.")
         return None
 
@@ -443,27 +502,11 @@ def run_diff_and_get_report_path():
         print("Не удалось сформировать сравнение.")
         return None
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     # Сохраняем структурированные изменения ресурсов для истории (только JSON)
-    changes_json_path = REPORTS_DIR / f"changes_{ts}.json"
-    try:
-        with open(changes_json_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "timestamp": ts,
-                    "resources_changes": diff_result["resources_changes"],
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-    except OSError:
-        pass
-
+    _write_changes_json(ts, diff_result["resources_changes"])
     print(
         f"\nИзменений в столбце ресурсов: {len(diff_result['resources_changes'])}. "
-        f"JSON: {changes_json_path}"
+        f"JSON: {REPORTS_DIR / f'changes_{ts}.json'}"
     )
     return diff_result
 
@@ -471,11 +514,10 @@ def run_diff_and_get_report_path():
 def main():
     diff_result = run_diff_and_get_report_path()
     if diff_result is None:
-        # Сообщения уже выведены внутри run_diff_and_get_report_path
-        if not DATA_DIR.exists() or len(list(DATA_DIR.glob("sheet_*.csv"))) <= 1:
+        # Нет предыдущей версии (первый запуск) — выход 0; иначе ошибка — 1
+        if not PREVIOUS_SHEET_PATH.exists():
             sys.exit(0)
-        else:
-            sys.exit(1)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
