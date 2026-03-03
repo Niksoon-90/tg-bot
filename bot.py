@@ -5,9 +5,11 @@
 и отправляет последний отчёт в чат.
 """
 
+import json
 import logging
 import os
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
+from pathlib import Path
 
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -17,6 +19,59 @@ import sheet_diff
 
 # Токен бота берём из переменной окружения (удобно для Railway и других хостингов)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+# Файл с подписками на рассылку (chat_id)
+SUBSCRIPTIONS_FILE = Path(__file__).resolve().parent / "subscriptions.json"
+
+
+def _load_subscriptions() -> list:
+    """Список chat_id подписчиков на рассылку."""
+    if not SUBSCRIPTIONS_FILE.exists():
+        return []
+    try:
+        with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return list(data.get("chat_ids", []))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _save_subscriptions(chat_ids: list) -> None:
+    chat_ids = list(dict.fromkeys(chat_ids))  # без дубликатов
+    try:
+        with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"chat_ids": chat_ids}, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _add_subscription(chat_id: int) -> bool:
+    ids = _load_subscriptions()
+    if chat_id in ids:
+        return False
+    ids.append(chat_id)
+    _save_subscriptions(ids)
+    return True
+
+
+def _remove_subscription(chat_id: int) -> bool:
+    ids = _load_subscriptions()
+    if chat_id not in ids:
+        return False
+    ids.remove(chat_id)
+    _save_subscriptions(ids)
+    return True
+
+
+def _is_work_hours_msk() -> bool:
+    """Понедельник–пятница, 9:30–17:30 по МСК (17:30 не входит)."""
+    now = sheet_diff.now_msk()
+    if now.weekday() >= 5:  # 5=суббота, 6=воскресенье
+        return False
+    t = now.time()
+    start = time(9, 30)
+    end = time(17, 30)
+    return start <= t < end
 
 
 logging.basicConfig(
@@ -41,6 +96,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history_today – история за сегодня\n\n"
         "/history_yesterday – история за вчера\n\n"
         "/last_update – когда последний раз загружались данные\n\n"
+        "/subscribe – подписаться на рассылку (пн–пт 9:30–17:30 МСК)\n\n"
+        "/unsubscribe – отписаться от рассылки\n\n"
         "/help – подсказка по командам"
     )
     await update.message.reply_text(text, reply_markup=_last_data_keyboard())
@@ -58,6 +115,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/history_today – история за сегодня.\n"
         "/history_yesterday – история за вчера.\n"
         "/last_update – когда последний раз были получены данные из Google Sheets.\n"
+        "/subscribe – подписаться на рассылку отчётов (пн–пт 9:30–17:30 МСК).\n"
+        "/unsubscribe – отписаться от рассылки.\n"
         "\n"
         "/history [period] показывает строки с изменениями в столбце "
         "\"Количество ресурсов, необходимое к подбору\" за период.\n"
@@ -95,17 +154,19 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Запусти команду ещё раз позже, когда в таблице будут изменения.",
         )
         return
+    text = _format_report_message(diff_result)
+    await context.bot.send_message(chat_id, text)
+
+
+def _format_report_message(diff_result: dict) -> str:
+    """Формирует текст отчёта для отправки в чат или в рассылку."""
     changes = diff_result.get("resources_changes", [])
     added_rows = diff_result.get("added", [])
     removed_rows = diff_result.get("removed", [])
     headers = diff_result.get("headers", [])
-    today_str = datetime.now().date().isoformat()
-    lines = [
-        f"Дата: {today_str}",
-        "",
-    ]
+    today_str = sheet_diff.now_msk().date().isoformat()
+    lines = [f"Дата: {today_str}", ""]
 
-    # Блок по изменениям количества ресурсов
     if changes:
         for c in changes:
             tk_type = c.get("tk_type") or "-"
@@ -120,15 +181,12 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         lines.append("Изменений в количестве ресурсов нет.")
 
-    # Отдельный блок по добавленным/удалённым строкам
     if added_rows or removed_rows:
-        # Попробуем вытащить индексы нужных столбцов
         def idx(col_name, default=-1):
             try:
                 return headers.index(col_name)
             except ValueError:
                 return default
-
         tk_idx = idx("ТК")
         tk_type_idx = idx("Тип ТК")
         city_idx = idx("Город")
@@ -136,51 +194,69 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         def fmt_row(row):
             tk = (row[tk_idx].strip() if tk_idx >= 0 and len(row) > tk_idx else "-")
-            tk_type = (
-                row[tk_type_idx].strip()
-                if tk_type_idx >= 0 and len(row) > tk_type_idx
-                else "-"
-            )
-            city = (
-                row[city_idx].strip()
-                if city_idx >= 0 and len(row) > city_idx
-                else "-"
-            )
-            resource_type = (
-                row[res_type_idx].strip()
-                if res_type_idx >= 0 and len(row) > res_type_idx
-                else "-"
-            )
+            tk_type = (row[tk_type_idx].strip() if tk_type_idx >= 0 and len(row) > tk_type_idx else "-")
+            city = (row[city_idx].strip() if city_idx >= 0 and len(row) > city_idx else "-")
+            resource_type = (row[res_type_idx].strip() if res_type_idx >= 0 and len(row) > res_type_idx else "-")
             return f"{tk_type} - {tk} ({city}, {resource_type})"
 
         lines.append("")
         lines.append("=== ДОБАВЛЕННЫЕ / УДАЛЁННЫЕ СТРОКИ ===")
-
         if added_rows:
             lines.append("Новые строки:")
             for _, row in added_rows:
                 lines.append(f"  {fmt_row(row)}")
-
         if removed_rows:
             lines.append("Удалённые строки:")
             for _, row in removed_rows:
                 lines.append(f"  {fmt_row(row)}")
 
-    await context.bot.send_message(chat_id, "\n".join(lines))
+    return "\n".join(lines)
+
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Подписаться на рассылку (пн–пт 9:30–17:30 МСК)."""
+    chat_id = update.effective_chat.id
+    if _add_subscription(chat_id):
+        await update.message.reply_text(
+            "Вы подписаны на рассылку. Буду присылать отчёты по изменениям в таблице "
+            "в рабочие часы (пн–пт 9:30–17:30 МСК) после каждого автообновления."
+        )
+    else:
+        await update.message.reply_text("Вы уже подписаны на рассылку.")
+
+
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отписаться от рассылки."""
+    chat_id = update.effective_chat.id
+    if _remove_subscription(chat_id):
+        await update.message.reply_text("Вы отписаны от рассылки.")
+    else:
+        await update.message.reply_text("Вы не были подписаны на рассылку.")
 
 
 async def auto_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Фоновая задача: раз в 30 минут подтягивает новую версию таблицы
-    и, при наличии предыдущей, пишет сравнение и историю.
-    Сообщения в чат не шлёт, чтобы не спамить — данные доступны через /history.
+    Фоновая задача: раз в 30 минут подтягивает новую версию таблицы,
+    при наличии предыдущей пишет сравнение и историю.
+    В рабочие часы (пн–пт 9:30–17:30 МСК) шлёт отчёт подписчикам.
     """
     try:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        banner = f"******** АВТО-ОБНОВЛЕНИЕ КАЖДЫЕ 30 МИН — ЗАПРОС ДАННЫХ ИЗ GOOGLE SHEETS {now_str} ********"
+        now_str = sheet_diff.now_msk().strftime("%Y-%m-%d %H:%M:%S")
+        banner = f"******** АВТО-ОБНОВЛЕНИЕ КАЖДЫЕ 30 МИН — ЗАПРОС ДАННЫХ ИЗ GOOGLE SHEETS (МСК) {now_str} ********"
         print(banner)
         logger.info(banner)
-        sheet_diff.run_diff_and_get_report_path()
+        diff_result = sheet_diff.run_diff_and_get_report_path()
+
+        # Рассылка подписчикам только в рабочие часы по МСК
+        if _is_work_hours_msk() and diff_result is not None:
+            subscribers = _load_subscriptions()
+            if subscribers:
+                text = _format_report_message(diff_result)
+                for chat_id in subscribers:
+                    try:
+                        await context.bot.send_message(chat_id, f"📋 Рассылка (автообновление):\n\n{text}")
+                    except Exception as e:
+                        logger.warning("Не удалось отправить рассылку в %s: %s", chat_id, e)
     except Exception:
         logger.exception("Ошибка в автоматическом обновлении из Google Sheets")
 
@@ -316,7 +392,7 @@ def _format_last_update_message():
     dt = sheet_diff.get_last_update_time()
     if dt is None:
         return "Данные из Google Sheets ещё ни разу не загружались (нет сохранённых отчётов)."
-    return f"Последнее обновление данных из Google Sheets: {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+    return f"Последнее обновление данных из Google Sheets (МСК): {dt.strftime('%Y-%m-%d %H:%M:%S')}"
 
 
 async def last_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -366,14 +442,16 @@ def main() -> None:
                 BotCommand("history_today", "История за сегодня"),
                 BotCommand("history_yesterday", "История за вчера"),
                 BotCommand("last_update", "Когда последний раз обновлялись данные"),
+                BotCommand("subscribe", "Подписаться на рассылку"),
+                BotCommand("unsubscribe", "Отписаться от рассылки"),
                 BotCommand("help", "Показать помощь по командам"),
             ]
         )
         # Сразу при запуске бота делаем один запрос к Google Sheets
         try:
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_str = sheet_diff.now_msk().strftime("%Y-%m-%d %H:%M:%S")
             banner = (
-                f"******** ПЕРВИЧНЫЙ ЗАПРОС ДАННЫХ ИЗ GOOGLE SHEETS ПРИ ЗАПУСКЕ БОТА {now_str} ********"
+                f"******** ПЕРВИЧНЫЙ ЗАПРОС ДАННЫХ ИЗ GOOGLE SHEETS ПРИ ЗАПУСКЕ БОТА (МСК) {now_str} ********"
             )
             print(banner)
             logger.info(banner)
@@ -414,6 +492,8 @@ def main() -> None:
     application.add_handler(CommandHandler("history_today", history_today))
     application.add_handler(CommandHandler("history_yesterday", history_yesterday))
     application.add_handler(CommandHandler("last_update", last_update))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
     application.add_handler(CallbackQueryHandler(button_last_data, pattern="^last_data$"))
     application.add_error_handler(error_handler)
 

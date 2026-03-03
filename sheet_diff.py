@@ -13,6 +13,19 @@ import sys
 import json
 from datetime import datetime, timedelta
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from datetime import timezone
+    ZoneInfo = lambda name: timezone(timedelta(hours=3))  # fallback MSK для Python 3.8
+
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def now_msk():
+    """Текущее время по Москве (для единообразия в ответах и в JSON)."""
+    return datetime.now(MSK).replace(tzinfo=None)  # naive datetime, но в МСК
+
 # Корректный вывод UTF-8 в консоль Windows
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -56,7 +69,7 @@ def ensure_dirs():
 
 def cleanup_old_data():
     """Удаляет старые отчёты (report_*.txt, changes_*.json) старше RETENTION_DAYS. CSV не трогаем — храним только 2 файла."""
-    cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
+    cutoff = now_msk() - timedelta(days=RETENTION_DAYS)
     for directory, pattern in (
         (REPORTS_DIR, "report_*.txt"),
         (REPORTS_DIR, "changes_*.json"),
@@ -396,7 +409,7 @@ def write_report(diff_result, report_path):
     lines = []
     lines.append("=" * 60)
     lines.append("ОТЧЁТ ПО ИЗМЕНЕНИЯМ ТАБЛИЦЫ")
-    lines.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append(now_msk().strftime("%Y-%m-%d %H:%M:%S"))
     lines.append("=" * 60)
 
     added = diff_result["added"]
@@ -481,15 +494,15 @@ def run_diff_and_get_report_path():
     current_path = save_current(rows)
     print(f"Текущая версия сохранена: {current_path}")
 
-    # Время последней загрузки — обновляем при каждой успешной выгрузке (для /last_update)
+    # Время последней загрузки (МСК) — для /last_update и единообразия
     try:
         with open(LAST_FETCH_TIME_FILE, "w", encoding="utf-8") as f:
-            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            f.write(now_msk().strftime("%Y-%m-%d %H:%M:%S"))
     except OSError:
         pass
 
     previous_rows = load_previous()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = now_msk().strftime("%Y%m%d_%H%M%S")
 
     if previous_rows is None:
         # Всё равно пишем пустой отчёт за этот запуск — чтобы /history_today показывал «изменений не было», а не «отчётов не найдено»

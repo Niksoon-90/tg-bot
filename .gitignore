@@ -12,6 +12,7 @@ ENV/
 # Данные бота (не коммитим)
 sheet_versions/
 reports/
+subscriptions.json
 
 # Переменные окружения (если используете .env)
 .env
