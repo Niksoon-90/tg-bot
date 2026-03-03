@@ -1,0 +1,4 @@
+# На Mac скрипты с CRLF не запускаются (ошибка «повреждён»)
+*.command text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
