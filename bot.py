@@ -11,8 +11,8 @@ import os
 from datetime import datetime, timedelta, date, time
 from pathlib import Path
 
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update, BotCommand
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import Conflict
 
 import sheet_diff
@@ -82,11 +82,8 @@ logger = logging.getLogger(__name__)
 
 
 def _main_keyboard():
-    """Клавиатура: последние данные, с последнего запроса."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Посмотреть последние данные", callback_data="last_data")],
-        [InlineKeyboardButton("С последнего запроса", callback_data="since_last_request")],
-    ])
+    """Клавиатура под сообщением (сейчас пустая — без кнопок)."""
+    return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -97,6 +94,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history_today – история за сегодня\n\n"
         "/history_yesterday – история за вчера\n\n"
         "/last_update – когда последний раз загружались данные\n\n"
+        "/since_last_request – изменения с последнего /update\n\n"
         "/subscribe – подписаться на рассылку (пн–пт 9:30–17:30 МСК каждые 30 мин)\n\n"
         "/unsubscribe – отписаться от рассылки\n\n"
         "/help – подсказка по командам"
@@ -116,6 +114,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/history_today – история за сегодня.\n"
         "/history_yesterday – история за вчера.\n"
         "/last_update – когда последний раз были получены данные из Google Sheets.\n"
+        "/since_last_request – изменения в таблице с момента последнего /update (без нового /update).\n"
         "/subscribe – рассылка пн–пт 9:30–17:30 МСК каждые 30 мин (за день + с последнего запроса).\n"
         "/unsubscribe – отписаться от рассылки.\n"
         "\n"
@@ -271,7 +270,7 @@ async def scheduled_tasks_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # 09:10–09:20 МСК пн–пт: утренний отчёт подписчикам (изменения с последнего запроса до конца вчера)
         if t.hour == 9 and 10 <= t.minute < 20 and today.weekday() < 5:
-            sent_file = Path(__file__).resolve().parent / "reports" / "last_morning_report.txt"
+            sent_file = sheet_diff.REPORTS_DIR / "last_morning_report.txt"
             try:
                 last_sent = sent_file.read_text(encoding="utf-8").strip() if sent_file.exists() else ""
                 if last_sent != today.isoformat():
@@ -324,8 +323,9 @@ def _parse_history_range(args):
       /history month
       /history YYYY-MM-DD YYYY-MM-DD
     Возвращает (start_date, end_date) или (None, None) при ошибке.
+    Для относительных периодов (today, yesterday, week, month) используется дата по МСК.
     """
-    today = date.today()
+    today = sheet_diff.now_msk().date()
     if not args:
         return today, today
 
@@ -385,57 +385,71 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # «За сегодня»: снимок начала дня (JSON) + запрос в Google, выводим изменения по маске
+    today_msk = sheet_diff.now_msk().date()
+    if start_date == end_date and start_date == today_msk:
+        await _send_history_today(chat_id, context)
+        return
     await _send_history_for_range(chat_id, start_date, end_date, context)
 
 
 async def _send_history_for_range(
     chat_id: int, start_date: date, end_date: date, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Общий помощник: отправляет историю за указанный период."""
-    changes = sheet_diff.list_resource_changes_in_range(start_date, end_date)
-    if not changes:
-        if sheet_diff.has_reports_in_range(start_date, end_date):
-            await context.bot.send_message(
-                chat_id,
-                f"За период {start_date} — {end_date} изменений в столбце «Количество ресурсов, необходимое к подбору» не было.",
-            )
-        else:
-            await context.bot.send_message(
-                chat_id,
-                f"Отчётов за период {start_date} — {end_date} не найдено. "
-                "Сделайте /update или подождите автообновления.",
-            )
+    """
+    История за период: JSON начала первой даты + JSON конца последней даты, diff по маске.
+    Один день — get_diff_for_day, несколько дней — get_diff_for_range.
+    """
+    if start_date == end_date:
+        diff_result = sheet_diff.get_diff_for_day(start_date)
+    else:
+        diff_result = sheet_diff.get_diff_for_range(start_date, end_date)
+
+    if diff_result is None:
+        await context.bot.send_message(
+            chat_id,
+            f"Нет снимков на начало и/или конец дня за период {start_date} — {end_date}. "
+            "Снимки создаются в 00:30 (начало дня) и 23:00 (конец дня) МСК.",
+        )
         return
 
-    header = f"Период: {start_date} — {end_date}"
-    lines = [header, "", "Количество ресурсов, необходимое к подбору:"]
+    title = f"Период: {start_date} — {end_date}. Количество ресурсов, необходимое к подбору:"
+    text = _format_changes_only(diff_result, title)
+    await context.bot.send_message(chat_id, text)
 
-    for ch in changes:
-        tk_type = ch["tk_type"] or "-"
-        tk = ch["tk"] or "-"
-        city = ch["city"] or "-"
-        resource_type = (ch.get("resource_type") or "").strip() or "-"
-        old_raw = (ch.get("old", "") or "").strip()
-        new_raw = (ch.get("new", "") or "").strip()
-        old = old_raw if old_raw else "0"
-        new = new_raw if new_raw else "0"
-        lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
 
-    text_out = "\n".join(lines)
-    await context.bot.send_message(chat_id, text_out)
+async def _send_history_today(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """История за сегодня: JSON начала дня + запрос в Google, выводим строки что изменились по маске."""
+    await context.bot.send_message(chat_id, "Загружаю таблицу и сравниваю с началом дня...")
+    try:
+        diff_result = sheet_diff.get_diff_for_today()
+    except Exception as e:
+        logger.exception("Ошибка при истории за сегодня")
+        await context.bot.send_message(chat_id, f"Не удалось загрузить данные: {e}")
+        return
+    if diff_result is None:
+        await context.bot.send_message(
+            chat_id,
+            "Нет снимка на начало дня или не удалось загрузить таблицу. "
+            "Снимок создаётся в 00:30 МСК или при первом /update за день.",
+        )
+        return
+    today_str = sheet_diff.now_msk().date().isoformat()
+    title = f"За сегодня ({today_str}). Количество ресурсов, необходимое к подбору:"
+    text = _format_changes_only(diff_result, title)
+    await context.bot.send_message(chat_id, text)
 
 
 async def history_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """История изменений за сегодня."""
+    """История за сегодня: снимок начала дня (JSON) + запрос в Google, выводим что изменилось по маске."""
     chat_id = update.effective_chat.id
-    d = date.today()
-    await _send_history_for_range(chat_id, d, d, context)
+    await _send_history_today(chat_id, context)
 
 
 async def history_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """История изменений за вчера."""
+    """История изменений за вчера (дата по МСК)."""
     chat_id = update.effective_chat.id
-    d = date.today() - timedelta(days=1)
+    d = sheet_diff.now_msk().date() - timedelta(days=1)
     await _send_history_for_range(chat_id, d, d, context)
 
 
@@ -452,14 +466,6 @@ async def last_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.effective_chat.id
     text = _format_last_update_message()
     await context.bot.send_message(chat_id, text)
-
-
-async def button_last_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик кнопки «Посмотреть последние данные»."""
-    query = update.callback_query
-    await query.answer()
-    text = _format_last_update_message()
-    await query.edit_message_text(text=text, reply_markup=_main_keyboard())
 
 
 def _format_changes_only(diff_result: dict, title: str) -> str:
@@ -522,30 +528,26 @@ def _format_subscription_message(diff_day, diff_since) -> str:
     return "\n".join(lines)
 
 
-async def button_since_last_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик кнопки «С последнего запроса»: сравнение с последними «текущими данными»."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(text="Сравниваю с последним запросом...", reply_markup=_main_keyboard())
+async def since_last_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /since_last_request: сравнение текущей таблицы с последним /update (без обновления снимка)."""
+    chat_id = update.effective_chat.id
+    await context.bot.send_message(chat_id, "Сравниваю с последним запросом...")
     try:
         diff_result = sheet_diff.run_diff_since_last_request()
     except Exception as e:
         logger.exception("Ошибка при сравнении с последним запросом")
-        await query.edit_message_text(
-            text=f"Не удалось загрузить данные: {e}",
-            reply_markup=_main_keyboard(),
-        )
+        await context.bot.send_message(chat_id, f"Не удалось загрузить данные: {e}")
         return
     if diff_result is None:
-        await query.edit_message_text(
-            text="Нет сохранённых данных последнего запроса. Сделайте /update, затем нажмите «С последнего запроса».",
-            reply_markup=_main_keyboard(),
+        await context.bot.send_message(
+            chat_id,
+            "Нет сохранённых данных последнего запроса. Сделайте /update, затем используйте /since_last_request.",
         )
         return
     _, ts = sheet_diff.load_last_user_request()
     title = f"Изменения с последнего запроса ({ts or '—'}):"
     text = _format_changes_only(diff_result, title)
-    await query.edit_message_text(text=text, reply_markup=_main_keyboard())
+    await context.bot.send_message(chat_id, text)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -580,6 +582,7 @@ def main() -> None:
                 BotCommand("history_today", "История за сегодня"),
                 BotCommand("history_yesterday", "История за вчера"),
                 BotCommand("last_update", "Когда последний раз обновлялись данные"),
+                BotCommand("since_last_request", "Изменения с последнего /update"),
                 BotCommand("subscribe", "Подписаться на рассылку"),
                 BotCommand("unsubscribe", "Отписаться от рассылки"),
                 BotCommand("help", "Показать помощь по командам"),
@@ -617,10 +620,9 @@ def main() -> None:
     application.add_handler(CommandHandler("history_today", history_today))
     application.add_handler(CommandHandler("history_yesterday", history_yesterday))
     application.add_handler(CommandHandler("last_update", last_update))
+    application.add_handler(CommandHandler("since_last_request", since_last_request))
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-    application.add_handler(CallbackQueryHandler(button_last_data, pattern="^last_data$"))
-    application.add_handler(CallbackQueryHandler(button_since_last_request, pattern="^since_last_request$"))
     application.add_error_handler(error_handler)
 
     logger.info("Бот запущен. Нажми Ctrl+C для остановки.")

@@ -11,12 +11,11 @@ import io
 import os
 import sys
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
-    from datetime import timezone
     ZoneInfo = lambda name: timezone(timedelta(hours=3))  # fallback MSK для Python 3.8
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -48,8 +47,12 @@ except ImportError:
 SPREADSHEET_ID = "1mEn564G6sfJvm96ff5XAyBVphDHWFzfZML2N6uhXyq4"
 GID = "1963801173"
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "sheet_versions"
-REPORTS_DIR = BASE_DIR / "reports"
+# При редеплое (Docker/Heroku/Railway и т.п.) рабочая директория часто очищается.
+# Укажите LIKA_DATA_DIR в путь к постоянному тому (volume), тогда JSON переживут редеплой.
+# Пример (Docker): -e LIKA_DATA_DIR=/data и монтирование: -v mydata:/data
+_DATA_ROOT = Path(os.environ.get("LIKA_DATA_DIR", BASE_DIR))
+DATA_DIR = _DATA_ROOT / "sheet_versions"
+REPORTS_DIR = _DATA_ROOT / "reports"
 # Снимки: начало дня (00:30), конец дня (23:00), последний запрос пользователя. Всё в JSON.
 # sheet_day_start_YYYYMMDD.json — стартовый снимок дня (создаётся в 00:30, при ошибке повтор каждые 10 мин)
 # sheet_day_end_YYYYMMDD.json — снимок на конец дня (23:00)
@@ -90,8 +93,10 @@ def cleanup_old_data():
             continue
         for path in directory.glob(pattern):
             try:
-                mtime = datetime.fromtimestamp(path.stat().st_mtime)
-                if mtime < cutoff:
+                # Время модификации файла в МСК для сравнения с cutoff (тоже МСК)
+                mtime_utc = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                mtime_msk = mtime_utc.astimezone(MSK).replace(tzinfo=None)
+                if mtime_msk < cutoff:
                     path.unlink()
             except OSError:
                 continue
@@ -465,9 +470,9 @@ def has_reports_in_range(start_date, end_date):
 
 def get_last_update_time():
     """
-    Возвращает datetime последней загрузки данных из Google Sheets.
+    Возвращает datetime последней загрузки данных из Google Sheets (наивный, по МСК).
     Берётся из файла last_fetch_time.txt (обновляется при каждой выгрузке),
-    иначе — по самому новому changes_*.json.
+    иначе — по самому новому changes_*.json. Все метки пишутся в МСК.
     """
     ensure_dirs()
     if LAST_FETCH_TIME_FILE.exists():
@@ -728,6 +733,48 @@ def run_diff_since_last_request():
     if prev_rows is None:
         return None
     return report_diff(rows, prev_rows)
+
+
+def get_diff_for_today():
+    """
+    История за сегодня: запрос к таблице Google + снимок начала дня (JSON).
+    Возвращает diff_result (изменения по столбцу «Количество ресурсов, необходимое к подбору»)
+    или None, если нет снимка на начало дня или не удалось загрузить таблицу.
+    Ничего не сохраняет (ни last_user_request, ни changes_*.json).
+    """
+    rows = fetch_and_parse_safe()
+    if not rows:
+        return None
+    today = now_msk().date()
+    start_rows = load_start_of_day(today)
+    if start_rows is None:
+        return None
+    return report_diff(rows, start_rows)
+
+
+def get_diff_for_day(d: date):
+    """
+    История за один день (например вчера): JSON начала дня + JSON конца дня.
+    Возвращает diff по маске (изменения в столбце «Количество ресурсов, необходимое к подбору»)
+    или None, если нет одного из снимков.
+    """
+    start_rows = load_start_of_day(d)
+    end_rows = load_end_of_day(d)
+    if start_rows is None or end_rows is None:
+        return None
+    return report_diff(end_rows, start_rows)
+
+
+def get_diff_for_range(start_date: date, end_date: date):
+    """
+    История за период: JSON начала первой даты периода + JSON конца последней даты периода.
+    Возвращает diff по маске или None, если нет одного из снимков.
+    """
+    start_rows = load_start_of_day(start_date)
+    end_rows = load_end_of_day(end_date)
+    if start_rows is None or end_rows is None:
+        return None
+    return report_diff(end_rows, start_rows)
 
 
 def get_diffs_for_subscription():
