@@ -168,8 +168,8 @@ def _format_report_message(diff_result: dict) -> str:
     today_str = sheet_diff.now_msk().date().isoformat()
     lines = [f"Дата: {today_str}", ""]
 
-    # Основной блок: только строки, где изменилось «Количество ресурсов, необходимое к подбору»
-    lines.append("Количество ресурсов, необходимое к подбору:")
+    # Изменения за сегодня в столбце «Количество ресурсов, необходимое к подбору»
+    lines.append("Изменения за сегодня (Количество ресурсов, необходимое к подбору):")
     if changes:
         for c in changes:
             tk_type = c.get("tk_type") or "-"
@@ -182,7 +182,7 @@ def _format_report_message(diff_result: dict) -> str:
             new = new_raw if new_raw else "0"
             lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
     else:
-        lines.append("  Изменений нет.")
+        lines.append("  Изменений за сегодня нет.")
 
     if added_rows or removed_rows:
         def idx(col_name, default=-1):
