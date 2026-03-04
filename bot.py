@@ -167,6 +167,8 @@ def _format_report_message(diff_result: dict) -> str:
     today_str = sheet_diff.now_msk().date().isoformat()
     lines = [f"Дата: {today_str}", ""]
 
+    # Основной блок: изменения в столбце «Количество ресурсов, необходимое к подбору»
+    lines.append("Количество ресурсов, необходимое к подбору:")
     if changes:
         for c in changes:
             tk_type = c.get("tk_type") or "-"
@@ -177,9 +179,9 @@ def _format_report_message(diff_result: dict) -> str:
             new_raw = (c.get("new", "") or "").strip()
             old = old_raw if old_raw else "0"
             new = new_raw if new_raw else "0"
-            lines.append(f"{tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
     else:
-        lines.append("Изменений в количестве ресурсов нет.")
+        lines.append("  Изменений нет.")
 
     if added_rows or removed_rows:
         def idx(col_name, default=-1):
@@ -345,7 +347,7 @@ async def _send_history_for_range(
         if sheet_diff.has_reports_in_range(start_date, end_date):
             await context.bot.send_message(
                 chat_id,
-                f"За период {start_date} — {end_date} изменений в количестве ресурсов не было.",
+                f"За период {start_date} — {end_date} изменений в столбце «Количество ресурсов, необходимое к подбору» не было.",
             )
         else:
             await context.bot.send_message(
@@ -356,7 +358,7 @@ async def _send_history_for_range(
         return
 
     header = f"Период: {start_date} — {end_date}"
-    lines = [header, ""]
+    lines = [header, "", "Количество ресурсов, необходимое к подбору:"]
 
     for ch in changes:
         tk_type = ch["tk_type"] or "-"
@@ -367,7 +369,7 @@ async def _send_history_for_range(
         new_raw = (ch.get("new", "") or "").strip()
         old = old_raw if old_raw else "0"
         new = new_raw if new_raw else "0"
-        lines.append(f"{tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+        lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
 
     text_out = "\n".join(lines)
     await context.bot.send_message(chat_id, text_out)

@@ -324,6 +324,19 @@ def find_column_index(headers, name):
     return -1
 
 
+def find_resources_column_index(headers):
+    """
+    Индекс столбца «Количество ресурсов, необходимое к подбору».
+    Сначала точное совпадение, затем по подстроке «Количество ресурсов».
+    При отсутствии — возвращает -1 (вызывающий код подставит столбец по умолчанию и выведет предупреждение).
+    """
+    idx = find_column_index(headers, COLUMN_RESOURCES)
+    if idx >= 0:
+        return idx
+    idx = find_column_index(headers, "Количество ресурсов")
+    return idx
+
+
 def build_row_map(rows, headers):
     """Словарь ключ строки -> полная строка (для быстрого поиска)."""
     key_to_row = {}
@@ -353,8 +366,12 @@ def report_diff(current_rows, previous_rows):
     removed_keys = keys_prev - keys_cur
     common_keys = keys_cur & keys_prev
 
-    res_col = find_column_index(headers_cur, COLUMN_RESOURCES)
+    res_col = find_resources_column_index(headers_cur)
     if res_col < 0:
+        print(
+            f"ВНИМАНИЕ: столбец «{COLUMN_RESOURCES}» не найден. Заголовки: {headers_cur}. Используется столбец по умолчанию (индекс 8).",
+            file=sys.stderr,
+        )
         res_col = 8  # столбец I по умолчанию
 
     # Индексы нужных для истории полей
