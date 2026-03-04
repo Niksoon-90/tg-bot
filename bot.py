@@ -81,10 +81,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _last_data_keyboard():
-    """Клавиатура с кнопкой «Посмотреть последние данные»."""
+def _main_keyboard():
+    """Клавиатура: последние данные и просмотр текущих значений столбца ресурсов."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Посмотреть последние данные", callback_data="last_data")],
+        [InlineKeyboardButton("Просмотр значений", callback_data="view_values")],
     ])
 
 
@@ -100,7 +101,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/unsubscribe – отписаться от рассылки\n\n"
         "/help – подсказка по командам"
     )
-    await update.message.reply_text(text, reply_markup=_last_data_keyboard())
+    await update.message.reply_text(text, reply_markup=_main_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -155,7 +156,7 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     text = _format_report_message(diff_result)
-    await context.bot.send_message(chat_id, text)
+    await context.bot.send_message(chat_id, text, reply_markup=_main_keyboard())
 
 
 def _format_report_message(diff_result: dict) -> str:
@@ -167,7 +168,7 @@ def _format_report_message(diff_result: dict) -> str:
     today_str = sheet_diff.now_msk().date().isoformat()
     lines = [f"Дата: {today_str}", ""]
 
-    # Основной блок: изменения в столбце «Количество ресурсов, необходимое к подбору»
+    # Основной блок: только строки, где изменилось «Количество ресурсов, необходимое к подбору»
     lines.append("Количество ресурсов, необходимое к подбору:")
     if changes:
         for c in changes:
@@ -409,7 +410,63 @@ async def button_last_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     text = _format_last_update_message()
-    await query.edit_message_text(text=text, reply_markup=_last_data_keyboard())
+    await query.edit_message_text(text=text, reply_markup=_main_keyboard())
+
+
+def _format_values_message(snapshot: list) -> str:
+    """Форматирует текущие значения: Тип ТК - ТК (Город, тип ресурса) значение."""
+    if not snapshot:
+        return "Нет сохранённых данных. Выполните /update, затем нажмите «Просмотр значений»."
+    lines = ["Количество ресурсов, необходимое к подбору (текущие значения):", ""]
+    for s in snapshot:
+        tk_type = s.get("tk_type") or "-"
+        tk = s.get("tk") or "-"
+        city = s.get("city") or "-"
+        resource_type = (s.get("resource_type") or "").strip() or "-"
+        val = (s.get("value") or "").strip() or "0"
+        lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {val}")
+    return "\n".join(lines)
+
+
+async def button_view_values(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопки «Просмотр значений» — показывает текущие значения по всем строкам."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        snapshot = sheet_diff.get_current_resources_snapshot()
+    except Exception as e:
+        logger.exception("Ошибка при получении текущих значений")
+        await query.edit_message_text(
+            text=f"Не удалось загрузить данные: {e}",
+            reply_markup=_main_keyboard(),
+        )
+        return
+    text = _format_values_message(snapshot)
+    # Telegram лимит 4096 символов — разбиваем на части при необходимости
+    max_len = 4000
+    if len(text) <= max_len:
+        await query.edit_message_text(text=text, reply_markup=_main_keyboard())
+    else:
+        lines = ["Количество ресурсов, необходимое к подбору (текущие значения):", ""]
+        for s in snapshot:
+            tk_type = s.get("tk_type") or "-"
+            tk = s.get("tk") or "-"
+            city = s.get("city") or "-"
+            resource_type = (s.get("resource_type") or "").strip() or "-"
+            val = (s.get("value") or "").strip() or "0"
+            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {val}")
+        parts = []
+        chunk = []
+        for line in lines:
+            if chunk and len("\n".join(chunk)) + len(line) + 1 > max_len:
+                parts.append("\n".join(chunk))
+                chunk = []
+            chunk.append(line)
+        if chunk:
+            parts.append("\n".join(chunk))
+        await query.edit_message_text(text=parts[0], reply_markup=_main_keyboard())
+        for p in parts[1:]:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=p)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,6 +554,7 @@ def main() -> None:
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
     application.add_handler(CallbackQueryHandler(button_last_data, pattern="^last_data$"))
+    application.add_handler(CallbackQueryHandler(button_view_values, pattern="^view_values$"))
     application.add_error_handler(error_handler)
 
     logger.info("Бот запущен. Нажми Ctrl+C для остановки.")

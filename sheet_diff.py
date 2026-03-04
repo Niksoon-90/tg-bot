@@ -139,6 +139,67 @@ def load_previous():
         return None
 
 
+def load_current():
+    """
+    Загружает текущую сохранённую версию из sheet_current.csv (если есть).
+    Нужно вызывать ДО save_current(), чтобы получить «предыдущий» снимок для сравнения.
+    """
+    ensure_dirs()
+    if not CURRENT_SHEET_PATH.exists():
+        return None
+    try:
+        with open(CURRENT_SHEET_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            return parse_csv(f.read())
+    except OSError:
+        return None
+
+
+def get_current_resources_snapshot():
+    """
+    Возвращает текущее состояние столбца «Количество ресурсов, необходимое к подбору»
+    по сохранённому sheet_current.csv. Для кнопки «Просмотр значений» в боте.
+    Возвращает список dict: tk_type, tk, city, resource_type, value.
+    """
+    ensure_dirs()
+    if not CURRENT_SHEET_PATH.exists():
+        return []
+    try:
+        with open(CURRENT_SHEET_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            rows = parse_csv(f.read())
+    except OSError:
+        return []
+    if not rows or len(rows) < 2:
+        return []
+    headers = [h.strip() if h else "" for h in rows[0]]
+    data = rows[1:]
+    res_col = find_resources_column_index(headers)
+    if res_col < 0:
+        res_col = 8
+    tk_idx = find_column_index(headers, "ТК")
+    tk_type_idx = find_column_index(headers, "Тип ТК")
+    city_idx = find_column_index(headers, "Город")
+    res_type_idx = find_column_index(headers, "Тип ресурса")
+    if res_type_idx < 0:
+        res_type_idx = 7
+    snapshot = []
+    for row in data:
+        k = row_key(row, headers)
+        if k is None:
+            continue
+        tk, res_type = k[0], k[1]
+        tk_type = row[tk_type_idx].strip() if tk_type_idx >= 0 and len(row) > tk_type_idx else ""
+        city = row[city_idx].strip() if city_idx >= 0 and len(row) > city_idx else ""
+        val = row[res_col].strip() if len(row) > res_col else ""
+        snapshot.append({
+            "tk": tk,
+            "resource_type": res_type,
+            "tk_type": tk_type,
+            "city": city,
+            "value": val,
+        })
+    return snapshot
+
+
 def save_current(rows):
     """Сохраняет текущую версию: бывший current → previous, новые данные → current. Всегда только 2 CSV."""
     ensure_dirs()
@@ -366,13 +427,16 @@ def report_diff(current_rows, previous_rows):
     removed_keys = keys_prev - keys_cur
     common_keys = keys_cur & keys_prev
 
-    res_col = find_resources_column_index(headers_cur)
-    if res_col < 0:
+    res_col_cur = find_resources_column_index(headers_cur)
+    if res_col_cur < 0:
         print(
             f"ВНИМАНИЕ: столбец «{COLUMN_RESOURCES}» не найден. Заголовки: {headers_cur}. Используется столбец по умолчанию (индекс 8).",
             file=sys.stderr,
         )
-        res_col = 8  # столбец I по умолчанию
+        res_col_cur = 8
+    res_col_prev = find_resources_column_index(headers_prev)
+    if res_col_prev < 0:
+        res_col_prev = 8
 
     # Индексы нужных для истории полей
     tk_idx = find_column_index(headers_cur, "ТК")
@@ -383,8 +447,8 @@ def report_diff(current_rows, previous_rows):
     for k in common_keys:
         row_cur = map_cur[k]
         row_prev = map_prev[k]
-        v_cur = row_cur[res_col].strip() if len(row_cur) > res_col else ""
-        v_prev = row_prev[res_col].strip() if len(row_prev) > res_col else ""
+        v_cur = row_cur[res_col_cur].strip() if len(row_cur) > res_col_cur else ""
+        v_prev = row_prev[res_col_prev].strip() if len(row_prev) > res_col_prev else ""
         if v_cur != v_prev:
             # Идентификация строки для отчёта
             tk = k[0]
@@ -412,12 +476,39 @@ def report_diff(current_rows, previous_rows):
                 }
             )
 
+    # Текущее состояние столбца ресурсов по всем строкам (для отображения в боте, когда изменений нет)
+    resources_snapshot = []
+    for k, row_cur in sorted(map_cur.items()):
+        tk = k[0]
+        res_type = k[1]
+        tk_type = (
+            row_cur[tk_type_idx].strip()
+            if tk_type_idx >= 0 and len(row_cur) > tk_type_idx
+            else ""
+        )
+        city = (
+            row_cur[city_idx].strip()
+            if city_idx >= 0 and len(row_cur) > city_idx
+            else ""
+        )
+        val = row_cur[res_col_cur].strip() if len(row_cur) > res_col_cur else ""
+        resources_snapshot.append(
+            {
+                "tk": tk,
+                "resource_type": res_type,
+                "tk_type": tk_type,
+                "city": city,
+                "value": val,
+            }
+        )
+
     return {
         "added": [(k, map_cur[k]) for k in sorted(added_keys)],
         "removed": [(k, map_prev[k]) for k in sorted(removed_keys)],
         "resources_changes": changes_resources,
+        "resources_snapshot": resources_snapshot,
         "headers": headers_cur,
-        "res_col": res_col,
+        "res_col": res_col_cur,
     }
 
 
@@ -508,24 +599,30 @@ def run_diff_and_get_report_path():
         print("Таблица пуста или не удалось распарсить CSV.")
         return None
 
-    current_path = save_current(rows)
-    print(f"Текущая версия сохранена: {current_path}")
+    # Важно: загружаем «предыдущий» снимок ДО перезаписи файлов (из current = последний запуск)
+    previous_rows = load_current()
+    ts = now_msk().strftime("%Y%m%d_%H%M%S")
 
-    # Время последней загрузки (МСК) — для /last_update и единообразия
+    if previous_rows is None:
+        # Первый запуск: сохраняем текущие данные как current, отчёта по изменениям ещё нет
+        save_current(rows)
+        try:
+            with open(LAST_FETCH_TIME_FILE, "w", encoding="utf-8") as f:
+                f.write(now_msk().strftime("%Y-%m-%d %H:%M:%S"))
+        except OSError:
+            pass
+        _write_changes_json(ts, [])
+        print("Предыдущей версии нет — это первый запуск. Отчёт по изменениям будет после следующего запуска.")
+        return None
+
+    # Сохраняем новую версию: старый current → previous, новые rows → current
+    save_current(rows)
+    print(f"Текущая версия сохранена: {CURRENT_SHEET_PATH}")
     try:
         with open(LAST_FETCH_TIME_FILE, "w", encoding="utf-8") as f:
             f.write(now_msk().strftime("%Y-%m-%d %H:%M:%S"))
     except OSError:
         pass
-
-    previous_rows = load_previous()
-    ts = now_msk().strftime("%Y%m%d_%H%M%S")
-
-    if previous_rows is None:
-        # Всё равно пишем пустой отчёт за этот запуск — чтобы /history_today показывал «изменений не было», а не «отчётов не найдено»
-        _write_changes_json(ts, [])
-        print("Предыдущей версии нет — это первый запуск. Отчёт по изменениям будет после следующего запуска.")
-        return None
 
     diff_result = report_diff(rows, previous_rows)
     if diff_result is None:
