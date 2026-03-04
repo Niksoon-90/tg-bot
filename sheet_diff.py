@@ -184,13 +184,20 @@ def _load_rows_json(path: Path):
         return None
 
 
+def _normalize_cell(s: str) -> str:
+    """Нормализация ячейки для ключа: trim и схлопывание пробелов, чтобы не дублировать строки."""
+    if not s:
+        return ""
+    return " ".join(str(s).strip().split())
+
+
 def row_key(row, headers):
     """Ключ строки для сравнения: ТК + Тип ресурса (уникально идентифицируют потребность)."""
     try:
         tk_idx = headers.index("ТК") if "ТК" in headers else 1
         res_idx = headers.index("Тип ресурса") if "Тип ресурса" in headers else 7
-        tk = (row[tk_idx] if len(row) > tk_idx else "").strip()
-        res = (row[res_idx] if len(row) > res_idx else "").strip()
+        tk = _normalize_cell(row[tk_idx] if len(row) > tk_idx else "")
+        res = _normalize_cell(row[res_idx] if len(row) > res_idx else "")
         return (tk, res)
     except (ValueError, IndexError):
         return None
@@ -721,6 +728,23 @@ def run_diff_since_last_request():
     if prev_rows is None:
         return None
     return report_diff(rows, prev_rows)
+
+
+def get_diffs_for_subscription():
+    """
+    Один запрос к таблице, два сравнения (для рассылки 9:30–17:30).
+    Возвращает (diff_for_day, diff_since_last) или (None, None) при ошибке загрузки.
+    last_user_request не обновляется.
+    """
+    rows = fetch_and_parse_safe()
+    if not rows:
+        return None, None
+    today = now_msk().date()
+    start_rows = load_start_of_day(today)
+    last_rows, _ = load_last_user_request()
+    diff_day = report_diff(rows, start_rows) if start_rows else None
+    diff_since = report_diff(rows, last_rows) if last_rows else None
+    return diff_day, diff_since
 
 
 def build_morning_report(yesterday: date):

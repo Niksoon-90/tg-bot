@@ -82,10 +82,10 @@ logger = logging.getLogger(__name__)
 
 
 def _main_keyboard():
-    """Клавиатура: последние данные и просмотр текущих значений столбца ресурсов."""
+    """Клавиатура: последние данные, с последнего запроса."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Посмотреть последние данные", callback_data="last_data")],
-        [InlineKeyboardButton("Просмотр значений", callback_data="view_values")],
+        [InlineKeyboardButton("С последнего запроса", callback_data="since_last_request")],
     ])
 
 
@@ -97,7 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history_today – история за сегодня\n\n"
         "/history_yesterday – история за вчера\n\n"
         "/last_update – когда последний раз загружались данные\n\n"
-        "/subscribe – подписаться на рассылку (пн–пт 9:30–17:30 МСК)\n\n"
+        "/subscribe – подписаться на рассылку (пн–пт 9:30–17:30 МСК каждые 30 мин)\n\n"
         "/unsubscribe – отписаться от рассылки\n\n"
         "/help – подсказка по командам"
     )
@@ -116,7 +116,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/history_today – история за сегодня.\n"
         "/history_yesterday – история за вчера.\n"
         "/last_update – когда последний раз были получены данные из Google Sheets.\n"
-        "/subscribe – подписаться на рассылку отчётов (пн–пт 9:30–17:30 МСК).\n"
+        "/subscribe – рассылка пн–пт 9:30–17:30 МСК каждые 30 мин (за день + с последнего запроса).\n"
         "/unsubscribe – отписаться от рассылки.\n"
         "\n"
         "/history [period] показывает строки с изменениями в столбце "
@@ -133,17 +133,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    await context.bot.send_message(chat_id, "Готовлю отчёт, подождите...")
+    await context.bot.send_message(chat_id, "Готовлю отчёт за день, подождите...")
 
     try:
-        diff_result = sheet_diff.run_diff_and_get_report_path()
+        diff_result, rows = sheet_diff.run_diff_for_day()
     except SystemExit as e:
         await context.bot.send_message(
             chat_id,
             f"Ошибка при загрузке таблицы или формировании отчёта: {e}",
         )
         return
-    except Exception as e:  # на всякий случай логируем любые другие ошибки
+    except Exception as e:
         logger.exception("Ошибка при формировании отчёта")
         await context.bot.send_message(chat_id, f"Не удалось сформировать отчёт: {e}")
         return
@@ -151,12 +151,15 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if diff_result is None:
         await context.bot.send_message(
             chat_id,
-            "Пока нечего сравнивать (скорее всего, это первый запуск). "
-            "Запусти команду ещё раз позже, когда в таблице будут изменения.",
+            "Нет снимка на начало дня (ожидайте 00:30 МСК или повторите позже). "
+            "Стартовый снимок создаётся в 00:30 каждого дня.",
         )
         return
     text = _format_report_message(diff_result)
     await context.bot.send_message(chat_id, text, reply_markup=_main_keyboard())
+    # Сохраняем эти данные как «текущие» (последний запрос пользователя)
+    if rows is not None:
+        sheet_diff.save_last_user_request(rows)
 
 
 def _format_report_message(diff_result: dict) -> str:
@@ -221,8 +224,8 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_id = update.effective_chat.id
     if _add_subscription(chat_id):
         await update.message.reply_text(
-            "Вы подписаны на рассылку. Буду присылать отчёты по изменениям в таблице "
-            "в рабочие часы (пн–пт 9:30–17:30 МСК) после каждого автообновления."
+            "Вы подписаны на рассылку. Каждые 30 минут (пн–пт 9:30–17:30 МСК) приходит отчёт: "
+            "за сегодня и изменения с последнего запроса."
         )
     else:
         await update.message.reply_text("Вы уже подписаны на рассылку.")
@@ -237,31 +240,77 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Вы не были подписаны на рассылку.")
 
 
-async def auto_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def scheduled_tasks_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Фоновая задача: раз в 30 минут подтягивает новую версию таблицы,
-    при наличии предыдущей пишет сравнение и историю.
-    В рабочие часы (пн–пт 9:30–17:30 МСК) шлёт отчёт подписчикам.
+    Задачи по расписанию (МСК), запускается каждые 10 мин:
+    - 00:30–05:00: создать снимок на начало дня (повтор при ошибке каждые 10 мин)
+    - 23:00–23:10: запрос таблицы и сохранение снимка на конец дня
+    - 09:10 пн–пт: отчёт «с момента последнего запроса» за вчера — рассылка подписчикам
     """
     try:
-        now_str = sheet_diff.now_msk().strftime("%Y-%m-%d %H:%M:%S")
-        banner = f"******** АВТО-ОБНОВЛЕНИЕ КАЖДЫЕ 30 МИН — ЗАПРОС ДАННЫХ ИЗ GOOGLE SHEETS (МСК) {now_str} ********"
-        print(banner)
-        logger.info(banner)
-        diff_result = sheet_diff.run_diff_and_get_report_path()
+        now = sheet_diff.now_msk()
+        today = now.date()
+        yesterday = today - timedelta(days=1)
+        t = now.time()
 
-        # Рассылка подписчикам только в рабочие часы по МСК
-        if _is_work_hours_msk() and diff_result is not None:
+        # 00:30–05:00 МСК: стартовый снимок дня (повтор каждые 10 мин пока не получится)
+        if (t.hour == 0 and t.minute >= 30) or (1 <= t.hour < 5):
+            if not sheet_diff.has_start_of_day(today):
+                if sheet_diff.ensure_start_of_day_snapshot():
+                    logger.info("Снимок на начало дня создан: %s", today)
+
+        # 23:00–23:10 МСК: снимок на конец дня
+        if t.hour == 23 and t.minute < 10:
+            if not sheet_diff.has_end_of_day(today):
+                rows = sheet_diff.fetch_and_parse_safe()
+                if rows:
+                    sheet_diff.save_end_of_day_snapshot(rows)
+                    sheet_diff.update_last_fetch_time()
+                    logger.info("Снимок на конец дня сохранён: %s", today)
+
+        # 09:10–09:20 МСК пн–пт: утренний отчёт подписчикам (изменения с последнего запроса до конца вчера)
+        if t.hour == 9 and 10 <= t.minute < 20 and today.weekday() < 5:
+            sent_file = Path(__file__).resolve().parent / "reports" / "last_morning_report.txt"
+            try:
+                last_sent = sent_file.read_text(encoding="utf-8").strip() if sent_file.exists() else ""
+                if last_sent != today.isoformat():
+                    diff_result = sheet_diff.build_morning_report(yesterday)
+                    if diff_result is not None:
+                        subscribers = _load_subscriptions()
+                        if subscribers:
+                            title = f"С момента последнего вашего запроса до конца дня {yesterday} были внесены следующие изменения:"
+                            text = _format_changes_only(diff_result, title)
+                            for chat_id in subscribers:
+                                try:
+                                    await context.bot.send_message(chat_id, f"📋 Утренний отчёт:\n\n{text}")
+                                except Exception as e:
+                                    logger.warning("Не удалось отправить утренний отчёт в %s: %s", chat_id, e)
+                        sent_file.parent.mkdir(parents=True, exist_ok=True)
+                        sent_file.write_text(today.isoformat(), encoding="utf-8")
+            except Exception:
+                logger.exception("Ошибка при формировании утреннего отчёта")
+
+        # 9:30–17:30 МСК пн–пт каждые 30 мин: рассылка подписчикам (за сегодня + с последнего запроса)
+        is_work_window = (t.hour > 9 or (t.hour == 9 and t.minute >= 30)) and (
+            t.hour < 17 or (t.hour == 17 and t.minute <= 30)
+        )
+        if is_work_window and (t.minute == 0 or t.minute == 30) and today.weekday() < 5:
             subscribers = _load_subscriptions()
             if subscribers:
-                text = _format_report_message(diff_result)
-                for chat_id in subscribers:
-                    try:
-                        await context.bot.send_message(chat_id, f"📋 Рассылка (автообновление):\n\n{text}")
-                    except Exception as e:
-                        logger.warning("Не удалось отправить рассылку в %s: %s", chat_id, e)
+                try:
+                    diff_day, diff_since = sheet_diff.get_diffs_for_subscription()
+                    if diff_day is None and diff_since is None:
+                        continue
+                    text = _format_subscription_message(diff_day, diff_since)
+                    for chat_id in subscribers:
+                            try:
+                                await context.bot.send_message(chat_id, f"📋 Рассылка:\n\n{text}")
+                            except Exception as e:
+                                logger.warning("Не удалось отправить рассылку в %s: %s", chat_id, e)
+                except Exception:
+                    logger.exception("Ошибка при формировании рассылки 9:30–17:30")
     except Exception:
-        logger.exception("Ошибка в автоматическом обновлении из Google Sheets")
+        logger.exception("Ошибка в задаче по расписанию")
 
 
 def _parse_history_range(args):
@@ -413,60 +462,90 @@ async def button_last_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.edit_message_text(text=text, reply_markup=_main_keyboard())
 
 
-def _format_values_message(snapshot: list) -> str:
-    """Форматирует текущие значения: Тип ТК - ТК (Город, тип ресурса) значение."""
-    if not snapshot:
-        return "Нет сохранённых данных. Выполните /update, затем нажмите «Просмотр значений»."
-    lines = ["Количество ресурсов, необходимое к подбору (текущие значения):", ""]
-    for s in snapshot:
-        tk_type = s.get("tk_type") or "-"
-        tk = s.get("tk") or "-"
-        city = s.get("city") or "-"
-        resource_type = (s.get("resource_type") or "").strip() or "-"
-        val = (s.get("value") or "").strip() or "0"
-        lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {val}")
+def _format_changes_only(diff_result: dict, title: str) -> str:
+    """Форматирует только блок изменений ресурсов (для «с последнего запроса» и утреннего отчёта)."""
+    changes = diff_result.get("resources_changes", [])
+    lines = [title, ""]
+    if not changes:
+        lines.append("  Изменений нет.")
+    else:
+        for c in changes:
+            tk_type = c.get("tk_type") or "-"
+            tk = c.get("tk") or "-"
+            city = c.get("city") or "-"
+            resource_type = (c.get("resource_type") or "").strip() or "-"
+            old = (c.get("old", "") or "").strip() or "0"
+            new = (c.get("new", "") or "").strip() or "0"
+            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
     return "\n".join(lines)
 
 
-async def button_view_values(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик кнопки «Просмотр значений» — показывает текущие значения по всем строкам."""
+def _format_subscription_message(diff_day, diff_since) -> str:
+    """
+    Формат рассылки 9:30–17:30: блок «За сегодня» и блок «Изменения с последнего запроса».
+    Пример:
+      За сегодня:
+        ГМ - 177 (Ижевск, Авто курьер) 6 → 4
+        ПВЗ - 42 (Москва, Пеший курьер) 2 → 3
+
+      ——————————————
+      Изменения с последнего запроса:
+        ПВЗ - 42 (Москва, Пеший курьер) 2 → 3
+    """
+    lines = ["За сегодня:", ""]
+    if diff_day and diff_day.get("resources_changes"):
+        for c in diff_day["resources_changes"]:
+            tk_type = c.get("tk_type") or "-"
+            tk = c.get("tk") or "-"
+            city = c.get("city") or "-"
+            resource_type = (c.get("resource_type") or "").strip() or "-"
+            old = (c.get("old", "") or "").strip() or "0"
+            new = (c.get("new", "") or "").strip() or "0"
+            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+    else:
+        lines.append("  Изменений нет.")
+    lines.append("")
+    lines.append("——————————————")
+    lines.append("Изменения с последнего запроса:")
+    lines.append("")
+    if diff_since and diff_since.get("resources_changes"):
+        for c in diff_since["resources_changes"]:
+            tk_type = c.get("tk_type") or "-"
+            tk = c.get("tk") or "-"
+            city = c.get("city") or "-"
+            resource_type = (c.get("resource_type") or "").strip() or "-"
+            old = (c.get("old", "") or "").strip() or "0"
+            new = (c.get("new", "") or "").strip() or "0"
+            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+    else:
+        lines.append("  Изменений нет.")
+    return "\n".join(lines)
+
+
+async def button_since_last_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопки «С последнего запроса»: сравнение с последними «текущими данными»."""
     query = update.callback_query
     await query.answer()
+    await query.edit_message_text(text="Сравниваю с последним запросом...", reply_markup=_main_keyboard())
     try:
-        snapshot = sheet_diff.get_current_resources_snapshot()
+        diff_result = sheet_diff.run_diff_since_last_request()
     except Exception as e:
-        logger.exception("Ошибка при получении текущих значений")
+        logger.exception("Ошибка при сравнении с последним запросом")
         await query.edit_message_text(
             text=f"Не удалось загрузить данные: {e}",
             reply_markup=_main_keyboard(),
         )
         return
-    text = _format_values_message(snapshot)
-    # Telegram лимит 4096 символов — разбиваем на части при необходимости
-    max_len = 4000
-    if len(text) <= max_len:
-        await query.edit_message_text(text=text, reply_markup=_main_keyboard())
-    else:
-        lines = ["Количество ресурсов, необходимое к подбору (текущие значения):", ""]
-        for s in snapshot:
-            tk_type = s.get("tk_type") or "-"
-            tk = s.get("tk") or "-"
-            city = s.get("city") or "-"
-            resource_type = (s.get("resource_type") or "").strip() or "-"
-            val = (s.get("value") or "").strip() or "0"
-            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {val}")
-        parts = []
-        chunk = []
-        for line in lines:
-            if chunk and len("\n".join(chunk)) + len(line) + 1 > max_len:
-                parts.append("\n".join(chunk))
-                chunk = []
-            chunk.append(line)
-        if chunk:
-            parts.append("\n".join(chunk))
-        await query.edit_message_text(text=parts[0], reply_markup=_main_keyboard())
-        for p in parts[1:]:
-            await context.bot.send_message(chat_id=query.message.chat_id, text=p)
+    if diff_result is None:
+        await query.edit_message_text(
+            text="Нет сохранённых данных последнего запроса. Сделайте /update, затем нажмите «С последнего запроса».",
+            reply_markup=_main_keyboard(),
+        )
+        return
+    _, ts = sheet_diff.load_last_user_request()
+    title = f"Изменения с последнего запроса ({ts or '—'}):"
+    text = _format_changes_only(diff_result, title)
+    await query.edit_message_text(text=text, reply_markup=_main_keyboard())
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -506,32 +585,19 @@ def main() -> None:
                 BotCommand("help", "Показать помощь по командам"),
             ]
         )
-        # Сразу при запуске бота делаем один запрос к Google Sheets
-        try:
-            now_str = sheet_diff.now_msk().strftime("%Y-%m-%d %H:%M:%S")
-            banner = (
-                f"******** ПЕРВИЧНЫЙ ЗАПРОС ДАННЫХ ИЗ GOOGLE SHEETS ПРИ ЗАПУСКЕ БОТА (МСК) {now_str} ********"
-            )
-            print(banner)
-            logger.info(banner)
-            sheet_diff.run_diff_and_get_report_path()
-        except Exception:
-            logger.exception("Ошибка при первичном обновлении из Google Sheets")
-
-        # Запускаем фоновую задачу автообновления каждые 30 минут,
-        # если JobQueue доступен (установлен extra 'job-queue')
+        # Задачи по расписанию: каждые 10 мин (00:30 старт дня, 23:00 конец дня, 09:10 утренний отчёт)
         jq = getattr(app, "job_queue", None)
         if jq is None:
             logger.warning(
-                "JobQueue не настроен, автообновление каждые 30 минут отключено. "
-                "Чтобы включить, установите: python-telegram-bot[job-queue]."
+                "JobQueue не настроен, расписание (00:30, 23:00, 09:10 МСК) отключено. "
+                "Установите: python-telegram-bot[job-queue]."
             )
         else:
             jq.run_repeating(
-                auto_update_job,
-                interval=30 * 60,
-                first=30 * 60,
-                name="auto_update_from_sheets",
+                scheduled_tasks_job,
+                interval=10 * 60,
+                first=60,
+                name="scheduled_tasks",
             )
 
     application = (
@@ -554,7 +620,7 @@ def main() -> None:
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
     application.add_handler(CallbackQueryHandler(button_last_data, pattern="^last_data$"))
-    application.add_handler(CallbackQueryHandler(button_view_values, pattern="^view_values$"))
+    application.add_handler(CallbackQueryHandler(button_since_last_request, pattern="^since_last_request$"))
     application.add_error_handler(error_handler)
 
     logger.info("Бот запущен. Нажми Ctrl+C для остановки.")
