@@ -11,7 +11,7 @@ import io
 import os
 import sys
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 try:
     from zoneinfo import ZoneInfo
@@ -50,13 +50,22 @@ GID = "1963801173"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "sheet_versions"
 REPORTS_DIR = BASE_DIR / "reports"
-# Текущий снимок и снимок «начало текущего дня» (для сравнения изменений за день). Храним в JSON.
-CURRENT_SHEET_PATH = DATA_DIR / "sheet_current.json"
-SHEET_BASELINE_TODAY = DATA_DIR / "sheet_baseline_today.json"
-LAST_BASELINE_DATE_FILE = DATA_DIR / "last_baseline_date.txt"  # дата базового снимка: YYYY-MM-DD
-# Снимки на конец дня (для сравнения между днями): sheet_day_YYYYMMDD.json
-# Время последней загрузки таблицы
+# Снимки: начало дня (00:30), конец дня (23:00), последний запрос пользователя. Всё в JSON.
+# sheet_day_start_YYYYMMDD.json — стартовый снимок дня (создаётся в 00:30, при ошибке повтор каждые 10 мин)
+# sheet_day_end_YYYYMMDD.json — снимок на конец дня (23:00)
+# sheet_last_user_request.json — «текущие данные», обновляются только при запросе пользователя
+LAST_USER_REQUEST_PATH = DATA_DIR / "sheet_last_user_request.json"
 LAST_FETCH_TIME_FILE = REPORTS_DIR / "last_fetch_time.txt"
+
+
+def update_last_fetch_time() -> None:
+    """Обновляет метку времени последней загрузки таблицы."""
+    ensure_dirs()
+    try:
+        with open(LAST_FETCH_TIME_FILE, "w", encoding="utf-8") as f:
+            f.write(now_msk().strftime("%Y-%m-%d %H:%M:%S"))
+    except OSError:
+        pass
 COLUMN_RESOURCES = "Количество ресурсов, необходимое к подбору"
 RETENTION_DAYS = 183  # храним данные примерно за полгода
 
@@ -86,23 +95,28 @@ def cleanup_old_data():
                     path.unlink()
             except OSError:
                 continue
-    for path in DATA_DIR.glob("sheet_day_*.json"):
-        try:
-            name = path.stem
-            if name.startswith("sheet_day_") and len(name) == 18:
-                d = datetime.strptime(name[10:18], "%Y%m%d").date()
+    for pattern in ("sheet_day_*.json", "sheet_day_start_*.json", "sheet_day_end_*.json"):
+        for path in DATA_DIR.glob(pattern):
+            try:
+                name = path.stem
+                if "sheet_day_start_" in name and len(name) == 24:
+                    d = datetime.strptime(name[16:24], "%Y%m%d").date()
+                elif "sheet_day_end_" in name and len(name) == 22:
+                    d = datetime.strptime(name[14:22], "%Y%m%d").date()
+                elif name.startswith("sheet_day_") and len(name) == 18:
+                    d = datetime.strptime(name[10:18], "%Y%m%d").date()
+                else:
+                    continue
                 if d < cutoff_date:
                     path.unlink()
-        except (ValueError, OSError):
-            continue
+            except (ValueError, OSError):
+                continue
 
 
 def fetch_sheet_csv():
-    """Загружает текущую версию таблицы в виде CSV."""
+    """Загружает текущую версию таблицы в виде CSV. При ошибке — SystemExit."""
     req = Request(EXPORT_URL)
     req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-    # Создаём SSL-контекст. Если доступен certifi — используем его хранилище сертификатов.
     if certifi is not None:
         context = ssl.create_default_context(cafile=certifi.where())
     else:
@@ -119,6 +133,24 @@ def fetch_sheet_csv():
     except URLError as e:
         raise SystemExit(f"Ошибка сети: {e.reason}")
     return data.decode("utf-8-sig", errors="replace")
+
+
+def fetch_and_parse_safe():
+    """Загружает таблицу и парсит CSV. При ошибке возвращает None (без SystemExit)."""
+    try:
+        req = Request(EXPORT_URL)
+        req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        if certifi is not None:
+            context = ssl.create_default_context(cafile=certifi.where())
+        else:
+            context = ssl.create_default_context()
+        with urlopen(req, timeout=30, context=context) as resp:
+            data = resp.read()
+        content = data.decode("utf-8-sig", errors="replace")
+        rows = parse_csv(content)
+        return rows if rows else None
+    except Exception:
+        return None
 
 
 def parse_csv(content):
@@ -164,75 +196,97 @@ def row_key(row, headers):
         return None
 
 
-def load_current():
-    """Загружает текущую сохранённую версию из sheet_current.json (если есть)."""
-    return _load_rows_json(CURRENT_SHEET_PATH)
+def _path_start_of_day(d: date) -> Path:
+    return DATA_DIR / f"sheet_day_start_{d:%Y%m%d}.json"
 
 
-def load_baseline_today():
+def _path_end_of_day(d: date) -> Path:
+    return DATA_DIR / f"sheet_day_end_{d:%Y%m%d}.json"
+
+
+def has_start_of_day(d: date) -> bool:
+    """Есть ли снимок на начало дня для даты d."""
+    return _path_start_of_day(d).exists()
+
+
+def has_end_of_day(d: date) -> bool:
+    """Есть ли снимок на конец дня для даты d."""
+    return _path_end_of_day(d).exists()
+
+
+def load_start_of_day(d: date):
+    """Загружает снимок на начало дня для даты d. Возвращает rows или None."""
+    return _load_rows_json(_path_start_of_day(d))
+
+
+def load_end_of_day(d: date):
+    """Загружает снимок на конец дня для даты d. Возвращает rows или None."""
+    return _load_rows_json(_path_end_of_day(d))
+
+
+def save_start_of_day(rows, d: date) -> None:
+    """Сохраняет снимок на начало дня для даты d."""
+    _save_rows_json(_path_start_of_day(d), rows)
+
+
+def save_end_of_day_snapshot(rows) -> None:
+    """Сохраняет снимок на конец дня (23:00). sheet_day_end_YYYYMMDD.json."""
+    today = now_msk().date()
+    _save_rows_json(_path_end_of_day(today), rows)
+    print(f"Снимок на конец дня сохранён: {_path_end_of_day(today)}")
+
+
+def ensure_start_of_day_snapshot() -> bool:
     """
-    Загружает снимок «начало текущего дня» и дату этого снимка.
-    Возвращает (rows или None, date или None).
+    Если снимка на начало сегодняшнего дня ещё нет — запрашиваем таблицу и сохраняем.
+    Возвращает True, если снимок есть (был или только что создан), False при ошибке загрузки.
+    Для 00:30 и повтора каждые 10 мин.
     """
-    ensure_dirs()
-    baseline_date = None
-    if LAST_BASELINE_DATE_FILE.exists():
-        try:
-            with open(LAST_BASELINE_DATE_FILE, "r", encoding="utf-8") as f:
-                s = f.read().strip()
-            if s:
-                baseline_date = datetime.strptime(s, "%Y-%m-%d").date()
-        except (OSError, ValueError):
-            pass
-    if not SHEET_BASELINE_TODAY.exists() or baseline_date is None:
+    today = now_msk().date()
+    if _path_start_of_day(today).exists():
+        return True
+    rows = fetch_and_parse_safe()
+    if not rows:
+        return False
+    save_start_of_day(rows, today)
+    update_last_fetch_time()
+    return True
+
+
+def load_last_user_request():
+    """Загружает «текущие данные» (последний запрос пользователя). Возвращает (rows, timestamp_str) или (None, None)."""
+    if not LAST_USER_REQUEST_PATH.exists():
         return None, None
-    rows = _load_rows_json(SHEET_BASELINE_TODAY)
-    return rows, baseline_date
-
-
-def ensure_baseline_for_today(rows):
-    """Если базового снимка на сегодня ещё нет — сохраняем текущие данные как «начало дня»."""
-    today = now_msk().date()
-    baseline_date = None
-    if LAST_BASELINE_DATE_FILE.exists():
-        try:
-            with open(LAST_BASELINE_DATE_FILE, "r", encoding="utf-8") as f:
-                s = f.read().strip()
-            if s:
-                baseline_date = datetime.strptime(s, "%Y-%m-%d").date()
-        except (OSError, ValueError):
-            pass
-    if baseline_date == today:
-        return
-    _save_rows_json(SHEET_BASELINE_TODAY, rows)
     try:
-        with open(LAST_BASELINE_DATE_FILE, "w", encoding="utf-8") as f:
-            f.write(today.strftime("%Y-%m-%d"))
-    except OSError:
-        pass
+        with open(LAST_USER_REQUEST_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rows = data.get("rows")
+        ts = data.get("timestamp", "")
+        if not rows:
+            return None, None
+        rows = [[str(c) for c in row] for row in rows]
+        return rows, ts
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None, None
 
 
-def is_end_of_day():
-    """Пора сохранить снимок на конец дня (23:45–00:15 МСК)."""
-    t = now_msk().time()
-    return (t.hour == 23 and t.minute >= 45) or (t.hour == 0 and t.minute < 15)
-
-
-def save_end_of_day_snapshot(rows):
-    """Сохраняет текущие данные как снимок на конец дня (sheet_day_YYYYMMDD.json)."""
-    today = now_msk().date()
-    path = DATA_DIR / f"sheet_day_{today:%Y%m%d}.json"
-    _save_rows_json(path, rows)
-    print(f"Снимок на конец дня сохранён: {path}")
+def save_last_user_request(rows) -> None:
+    """Сохраняет данные как «текущие» (последний запрос пользователя). Обновляется только при запросе пользователя."""
+    ensure_dirs()
+    ts = now_msk().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LAST_USER_REQUEST_PATH, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": ts, "rows": rows}, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"Ошибка записи {LAST_USER_REQUEST_PATH}: {e}", file=sys.stderr)
 
 
 def get_current_resources_snapshot():
     """
-    Возвращает текущее состояние столбца «Количество ресурсов, необходимое к подбору»
-    по сохранённому sheet_current.json. Для кнопки «Просмотр значений» в боте.
-    Возвращает список dict: tk_type, tk, city, resource_type, value.
+    Возвращает состояние столбца «Количество ресурсов, необходимое к подбору»
+    по «текущим данным» (последний запрос пользователя). Для кнопки «Просмотр значений».
     """
-    rows = _load_rows_json(CURRENT_SHEET_PATH)
+    rows, _ = load_last_user_request()
     if not rows or len(rows) < 2:
         return []
     headers = [h.strip() if h else "" for h in rows[0]]
@@ -265,10 +319,6 @@ def get_current_resources_snapshot():
     return snapshot
 
 
-def save_current(rows):
-    """Сохраняет текущую выгрузку в sheet_current.json."""
-    _save_rows_json(CURRENT_SHEET_PATH, rows)
-    return CURRENT_SHEET_PATH
 
 
 def _report_date_from_filename(path: Path):
@@ -636,61 +686,60 @@ def _write_changes_json(ts: str, resources_changes: list) -> None:
         print(f"Ошибка записи {path}: {e}", file=sys.stderr)
 
 
-def run_diff_and_get_report_path():
+def run_diff_for_day():
     """
-    Полный цикл с логикой «изменения за день»:
-    - скачивает текущую версию таблицы
-    - сравнивает с снимком «начало текущего дня» (базовый снимок)
-    - при каждом запросе/автообновлении выдаёт, что изменилось за сегодня
-    - в конце дня (23:45–00:15 МСК) сохраняет снимок дня для сравнения между днями
+    Запрос «за день»: загружает таблицу, сравнивает с снимком на начало сегодняшнего дня.
+    Возвращает (diff_result, rows) при успехе (чтобы бот сохранил rows в last_user_request),
+    или (None, None), если нет снимка на начало дня.
     """
     ensure_dirs()
     cleanup_old_data()
-    print("Загрузка таблицы...")
     csv_content = fetch_sheet_csv()
     rows = parse_csv(csv_content)
     if not rows:
-        print("Таблица пуста или не удалось распарсить CSV.")
-        return None
-
+        return None, None
     today = now_msk().date()
-    ts = now_msk().strftime("%Y%m%d_%H%M%S")
+    start_rows = load_start_of_day(today)
+    if start_rows is None:
+        # Снимка на начало дня ещё нет — этот запрос пользователя делаем снимком дня
+        save_start_of_day(rows, today)
+        start_rows = rows
+    update_last_fetch_time()
+    diff_result = report_diff(rows, start_rows)
+    if diff_result is not None:
+        ts = now_msk().strftime("%Y%m%d_%H%M%S")
+        _write_changes_json(ts, diff_result["resources_changes"])
+    return diff_result, rows
 
-    # Загружаем базовый снимок на сегодня (начало дня)
-    baseline_rows, baseline_date = load_baseline_today()
 
-    # Если базового снимка на сегодня нет — создаём (первый запуск дня или первый запуск вообще)
-    if baseline_date != today or baseline_rows is None:
-        ensure_baseline_for_today(rows)
-        baseline_rows = rows  # сравниваем с самими собой — изменений за день пока нет
-
-    save_current(rows)
-    print(f"Текущая версия сохранена: {CURRENT_SHEET_PATH}")
-    try:
-        with open(LAST_FETCH_TIME_FILE, "w", encoding="utf-8") as f:
-            f.write(now_msk().strftime("%Y-%m-%d %H:%M:%S"))
-    except OSError:
-        pass
-
-    diff_result = report_diff(rows, baseline_rows)
-    if diff_result is None:
-        print("Не удалось сформировать сравнение.")
+def run_diff_since_last_request():
+    """Сравнение «с последнего запроса»: текущая таблица vs последние «текущие данные»."""
+    rows = fetch_and_parse_safe()
+    if not rows:
         return None
+    prev_rows, _ = load_last_user_request()
+    if prev_rows is None:
+        return None
+    return report_diff(rows, prev_rows)
 
-    # В конце дня сохраняем снимок для последующего сравнения между днями
-    if is_end_of_day():
-        save_end_of_day_snapshot(rows)
 
-    _write_changes_json(ts, diff_result["resources_changes"])
-    print(
-        f"\nИзменений за сегодня в столбце ресурсов: {len(diff_result['resources_changes'])}. "
-        f"JSON: {REPORTS_DIR / f'changes_{ts}.json'}"
-    )
+def build_morning_report(yesterday: date):
+    """Отчёт 09:10: изменения с последнего запроса пользователя до конца вчерашнего дня."""
+    last_rows, _ = load_last_user_request()
+    end_rows = load_end_of_day(yesterday)
+    if last_rows is None or end_rows is None:
+        return None
+    return report_diff(end_rows, last_rows)
+
+
+def run_diff_and_get_report_path():
+    """Обёртка: (diff_result, rows) для обратной совместимости; бот сохраняет rows в last_user_request."""
+    diff_result, _ = run_diff_for_day()
     return diff_result
 
 
 def main():
-    diff_result = run_diff_and_get_report_path()
+    diff_result, _ = run_diff_for_day()
     if diff_result is None:
         sys.exit(1)
     sys.exit(0)
