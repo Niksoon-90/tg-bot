@@ -299,10 +299,9 @@ async def scheduled_tasks_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if subscribers:
                 try:
                     diff_day, diff_since = sheet_diff.get_diffs_for_subscription()
-                    if diff_day is None and diff_since is None:
-                        continue
-                    text = _format_subscription_message(diff_day, diff_since)
-                    for chat_id in subscribers:
+                    if diff_day is not None or diff_since is not None:
+                        text = _format_subscription_message(diff_day, diff_since)
+                        for chat_id in subscribers:
                             try:
                                 await context.bot.send_message(chat_id, f"📋 Рассылка:\n\n{text}")
                             except Exception as e:
