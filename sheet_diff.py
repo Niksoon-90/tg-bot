@@ -57,7 +57,9 @@ REPORTS_DIR = _DATA_ROOT / "reports"
 # sheet_day_start_YYYYMMDD.json — стартовый снимок дня (создаётся в 00:30, при ошибке повтор каждые 10 мин)
 # sheet_day_end_YYYYMMDD.json — снимок на конец дня (23:00)
 # sheet_last_user_request.json — «текущие данные», обновляются только при запросе пользователя
+# sheet_last_subscription_fetch.json — снимок таблицы на момент предыдущего запуска рассылки (9:30, 10:00, …)
 LAST_USER_REQUEST_PATH = DATA_DIR / "sheet_last_user_request.json"
+LAST_SUBSCRIPTION_FETCH_PATH = DATA_DIR / "sheet_last_subscription_fetch.json"
 LAST_FETCH_TIME_FILE = REPORTS_DIR / "last_fetch_time.txt"
 
 
@@ -291,6 +293,34 @@ def save_last_user_request(rows) -> None:
             json.dump({"timestamp": ts, "rows": rows}, f, ensure_ascii=False, indent=2)
     except OSError as e:
         print(f"Ошибка записи {LAST_USER_REQUEST_PATH}: {e}", file=sys.stderr)
+
+
+def load_last_subscription_fetch():
+    """Загружает снимок таблицы с предыдущего запуска рассылки (9:30, 10:00, …). Возвращает (rows, timestamp_str) или (None, None)."""
+    if not LAST_SUBSCRIPTION_FETCH_PATH.exists():
+        return None, None
+    try:
+        with open(LAST_SUBSCRIPTION_FETCH_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rows = data.get("rows")
+        ts = data.get("timestamp", "")
+        if not rows:
+            return None, None
+        rows = [[str(c) for c in row] for row in rows]
+        return rows, ts
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None, None
+
+
+def save_last_subscription_fetch(rows) -> None:
+    """Сохраняет текущее состояние таблицы как снимок для следующего запуска рассылки (дифф «с предыдущего запроса»)."""
+    ensure_dirs()
+    ts = now_msk().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LAST_SUBSCRIPTION_FETCH_PATH, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": ts, "rows": rows}, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"Ошибка записи {LAST_SUBSCRIPTION_FETCH_PATH}: {e}", file=sys.stderr)
 
 
 def get_current_resources_snapshot():
@@ -780,18 +810,26 @@ def get_diff_for_range(start_date: date, end_date: date):
 def get_diffs_for_subscription():
     """
     Один запрос к таблице, два сравнения (для рассылки 9:30–17:30).
-    Возвращает (diff_for_day, diff_since_last) или (None, None) при ошибке загрузки.
-    last_user_request не обновляется.
+    «За сегодня»: текущая таблица vs начало дня.
+    «С предыдущего запроса»: текущая таблица vs снимок предыдущего запуска рассылки (9:30→10:00, 10:00→10:30 и т.д.).
+    После вызова сохраняет текущее состояние в sheet_last_subscription_fetch для следующего интервала.
+    Возвращает (diff_day, diff_since, prev_ts) или (None, None, None) при ошибке. prev_ts — время предыдущего снимка (для подписи).
     """
     rows = fetch_and_parse_safe()
     if not rows:
-        return None, None
+        return None, None, None
+    update_last_fetch_time()
     today = now_msk().date()
     start_rows = load_start_of_day(today)
-    last_rows, _ = load_last_user_request()
+    prev_rows, prev_ts = load_last_subscription_fetch()
+    # Первый запуск дня (9:30): снимка рассылки ещё нет — сравниваем с началом дня (00:30)
+    if prev_rows is None and start_rows is not None:
+        prev_rows = start_rows
+        prev_ts = "00:30"
     diff_day = report_diff(rows, start_rows) if start_rows else None
-    diff_since = report_diff(rows, last_rows) if last_rows else None
-    return diff_day, diff_since
+    diff_since = report_diff(rows, prev_rows) if prev_rows else None
+    save_last_subscription_fetch(rows)
+    return diff_day, diff_since, prev_ts
 
 
 def build_morning_report(yesterday: date):

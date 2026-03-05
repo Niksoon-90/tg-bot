@@ -298,9 +298,10 @@ async def scheduled_tasks_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             subscribers = _load_subscriptions()
             if subscribers:
                 try:
-                    diff_day, diff_since = sheet_diff.get_diffs_for_subscription()
+                    diff_day, diff_since, prev_ts = sheet_diff.get_diffs_for_subscription()
                     if diff_day is not None or diff_since is not None:
-                        text = _format_subscription_message(diff_day, diff_since)
+                        now_ts = sheet_diff.now_msk()
+                        text = _format_subscription_message(diff_day, diff_since, prev_ts=prev_ts, current_ts=now_ts)
                         for chat_id in subscribers:
                             try:
                                 await context.bot.send_message(chat_id, f"📋 Рассылка:\n\n{text}")
@@ -468,61 +469,110 @@ async def last_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await context.bot.send_message(chat_id, text)
 
 
+def _normalized_value(val) -> str:
+    """Единая нормализация значения для сравнения и вывода (пусто → «0», 0.0 → «0»)."""
+    s = "" if val is None else str(val).strip()
+    s = s or "0"
+    if s in ("0.0", "0"):
+        return "0"
+    return s
+
+
+def _is_no_real_change(old_val, new_val) -> bool:
+    """True, если изменение несущественно (0→0, 0→0.0, пусто→0 и т.п.) — не показываем."""
+    o = _normalized_value(old_val)
+    n = _normalized_value(new_val)
+    if o == n:
+        return True
+    if o in ("0", "0.0") and n in ("0", "0.0"):
+        return True
+    return False
+
+
 def _format_changes_only(diff_result: dict, title: str) -> str:
-    """Форматирует только блок изменений ресурсов (для «с последнего запроса» и утреннего отчёта)."""
+    """Форматирует только блок изменений ресурсов; строки «X → X» не показываем."""
     changes = diff_result.get("resources_changes", [])
     lines = [title, ""]
-    if not changes:
+    shown = []
+    for c in changes:
+        if _is_no_real_change(c.get("old"), c.get("new")):
+            continue
+        old = _normalized_value(c.get("old"))
+        new = _normalized_value(c.get("new"))
+        tk_type = c.get("tk_type") or "-"
+        tk = c.get("tk") or "-"
+        city = c.get("city") or "-"
+        resource_type = (c.get("resource_type") or "").strip() or "-"
+        shown.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+    if not shown:
         lines.append("  Изменений нет.")
     else:
-        for c in changes:
-            tk_type = c.get("tk_type") or "-"
-            tk = c.get("tk") or "-"
-            city = c.get("city") or "-"
-            resource_type = (c.get("resource_type") or "").strip() or "-"
-            old = (c.get("old", "") or "").strip() or "0"
-            new = (c.get("new", "") or "").strip() or "0"
-            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+        lines.extend(shown)
     return "\n".join(lines)
 
 
-def _format_subscription_message(diff_day, diff_since) -> str:
+def _time_part_from_ts(ts) -> str:
+    """Из datetime или строки 'YYYY-MM-DD HH:MM:SS' извлекает время HH:MM для подписи."""
+    if ts is None:
+        return ""
+    if hasattr(ts, "strftime"):
+        return ts.strftime("%H:%M")
+    s = str(ts).strip()
+    if len(s) >= 16 and s[10] == " ":
+        return s[11:16]
+    return s[:5] if len(s) >= 5 else s
+
+
+def _format_subscription_message(diff_day, diff_since, prev_ts=None, current_ts=None) -> str:
     """
-    Формат рассылки 9:30–17:30: блок «За сегодня» и блок «Изменения с последнего запроса».
+    Формат рассылки 9:30–17:30: блок «За сегодня» и блок «Изменения за интервал» (пред. запрос → текущий).
     Пример:
       За сегодня:
         ГМ - 177 (Ижевск, Авто курьер) 6 → 4
-        ПВЗ - 42 (Москва, Пеший курьер) 2 → 3
 
       ——————————————
-      Изменения с последнего запроса:
+      Изменения за 9:30–10:00:
         ПВЗ - 42 (Москва, Пеший курьер) 2 → 3
     """
     lines = ["За сегодня:", ""]
     if diff_day and diff_day.get("resources_changes"):
+        day_lines = []
         for c in diff_day["resources_changes"]:
+            if _is_no_real_change(c.get("old"), c.get("new")):
+                continue
+            old = _normalized_value(c.get("old"))
+            new = _normalized_value(c.get("new"))
             tk_type = c.get("tk_type") or "-"
             tk = c.get("tk") or "-"
             city = c.get("city") or "-"
             resource_type = (c.get("resource_type") or "").strip() or "-"
-            old = (c.get("old", "") or "").strip() or "0"
-            new = (c.get("new", "") or "").strip() or "0"
-            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+            day_lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+        lines.extend(day_lines if day_lines else ["  Изменений нет."])
     else:
         lines.append("  Изменений нет.")
     lines.append("")
     lines.append("——————————————")
-    lines.append("Изменения с последнего запроса:")
+    interval_label = "Изменения с последнего запроса:"
+    if prev_ts is not None and current_ts is not None:
+        p = _time_part_from_ts(prev_ts)
+        c = _time_part_from_ts(current_ts)
+        if p and c:
+            interval_label = f"Изменения за {p}–{c}:"
+    lines.append(interval_label)
     lines.append("")
     if diff_since and diff_since.get("resources_changes"):
+        since_lines = []
         for c in diff_since["resources_changes"]:
+            if _is_no_real_change(c.get("old"), c.get("new")):
+                continue
+            old = _normalized_value(c.get("old"))
+            new = _normalized_value(c.get("new"))
             tk_type = c.get("tk_type") or "-"
             tk = c.get("tk") or "-"
             city = c.get("city") or "-"
             resource_type = (c.get("resource_type") or "").strip() or "-"
-            old = (c.get("old", "") or "").strip() or "0"
-            new = (c.get("new", "") or "").strip() or "0"
-            lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+            since_lines.append(f"  {tk_type} - {tk} ({city}, {resource_type}) {old} → {new}")
+        lines.extend(since_lines if since_lines else ["  Изменений нет."])
     else:
         lines.append("  Изменений нет.")
     return "\n".join(lines)
